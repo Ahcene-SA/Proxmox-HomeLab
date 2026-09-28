@@ -35,6 +35,43 @@ Network card type is `e1000` rather than `virtio`, since Metasploitable runs an 
 
 ---
 
+## Issue 0 — Confusion between `local` and `local-lvm` storage, and removing `local-lvm`
+
+**Symptom:** difficulty identifying which storage to use for the VM disk — the default Proxmox install ships with two separate storage entries, `local` and `local-lvm`, and it wasn't clear which one to target or why they behave differently.
+
+**What `local` and `local-lvm` actually are:**
+- `local` is **directory-type** storage — a plain folder on the root filesystem (`/var/lib/vz`). It stores ISOs, container templates, backups, and can also hold VM disks as flat files (`.raw` or `.qcow2`).
+- `local-lvm` is **LVM-thin** storage — a separate logical volume (`/dev/pve/data`) carved out at install time, normally used to store VM/container disks as thin-provisioned logical volumes rather than files.
+
+By default, Proxmox splits the disk this way so VM disks (`local-lvm`) are separated from ISOs/backups (`local`). In this setup, `local-lvm` was not going to be used going forward — every VM disk (Kali, Metasploitable) was being kept on `local` instead, so the separate LVM-thin pool was just unused space sitting idle on the drive.
+
+**Decision:** remove the `local-lvm` thin pool entirely and reclaim that space into the root filesystem, so `local` (and everything on it — ISOs, VM disks, backups) has more room to work with.
+
+**Commands used:**
+```bash
+# Remove the local-lvm thin pool (the underlying logical volume)
+lvremove /dev/pve/data
+
+# Grow the root logical volume into the freed space
+lvresize -l +100%FREE /dev/pve/root
+
+# Grow the actual filesystem to fill the resized logical volume
+resize2fs /dev/mapper/pve-root
+```
+
+Each command operates at a different layer, which is why all three were needed:
+1. `lvremove` deletes the LVM logical volume backing `local-lvm`, freeing that space at the volume-group level.
+2. `lvresize` extends the `root` logical volume to claim that newly freed space.
+3. `resize2fs` grows the ext4 filesystem itself to actually use the extra space `lvresize` just gave the volume — resizing the logical volume alone doesn't resize the filesystem sitting on top of it.
+
+After this, `local-lvm` no longer appeared as a storage option in Proxmox, and `local` had significantly more available space.
+
+**Trade-off:** LVM-thin storage supports live snapshots natively. Removing `local-lvm` and consolidating everything onto `local` (directory storage) is why raw-format disks on `local` needed converting to `qcow2` before they could be snapshotted — see Issue 3 below. Choosing `local` over `local-lvm` traded native snapshot support for simpler, file-based disk management and more usable space on the root filesystem.
+
+**Lesson:** the two default storages exist for different disk formats and use cases, not as redundant options — removing one is a real trade-off (here, snapshot capability) in exchange for consolidating space, not just a cosmetic cleanup.
+
+---
+
 ## Issue 1 — Wrong disk volume name on `local` storage
 
 **Command that failed:**
